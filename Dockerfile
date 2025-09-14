@@ -1,17 +1,26 @@
 # Use official Python 3.11 slim image
 FROM python:3.11-slim
 
-# Set working directory inside container
+# System dependencies: Tesseract (+languages) and Poppler for pdf2image
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tesseract-ocr tesseract-ocr-eng tesseract-ocr-osd tesseract-ocr-fas \
+    poppler-utils build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
 WORKDIR /app
 
-# Copy requirements and install
-COPY requirements.txt .
+# Leverage Docker cache for Python deps
+COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy source code
-COPY src/ ./src
+# FAISS only inside Docker
+RUN pip install --no-cache-dir faiss-cpu
 
-# Expose port 8000
+# Copy source code last (so code changes don't invalidate deps cache)
+COPY src/ /app/src
+
+# Expose port
 EXPOSE 8000
 
 # Run FastAPI app with uvicorn
