@@ -1,0 +1,35 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.ipynb_checkpoints/
+
+# Local config
+.env
+*.db
+*.sqlite3
+
+# Data & models (heavy stuff)
+data/
+models/
+*.faiss
+*.bin
+*.pt
+*.ckpt
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Docker
+*.pid
