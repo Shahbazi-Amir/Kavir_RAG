@@ -10,6 +10,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Set working directory
 WORKDIR /app
 
+# Set HuggingFace cache directory
+ENV HF_HOME=/root/.cache/huggingface
+
 # Install Python dependencies (cached if requirements.txt unchanged)
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
@@ -21,4 +24,4 @@ COPY src/ /app/src
 EXPOSE 8000
 
 # Run FastAPI app with uvicorn
-CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
