@@ -10,12 +10,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Set working directory
 WORKDIR /app
 
-# Leverage Docker cache for Python deps
+# Install Python dependencies (cached if requirements.txt unchanged)
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
-
-# FAISS only inside Docker
-RUN pip install --no-cache-dir faiss-cpu
 
 # Copy source code last (so code changes don't invalidate deps cache)
 COPY src/ /app/src

@@ -10,3 +10,6 @@ Pillow
 tqdm
 numpy
 scikit-learn
+torch
+faiss-cpu
+sentence-transformers
