@@ -23,6 +23,9 @@ models/
 *.pt
 *.ckpt
 
+# Hugging Face cache
+.cache/
+
 # OS-specific
 .DS_Store
 Thumbs.db
