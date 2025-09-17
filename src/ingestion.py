@@ -1,197 +1,134 @@
-"""
-ingestion.py
--------------
-Load documents (PDF, DOCX, TXT, CSV) and chunk text into overlapping windows.
-CLI usage:
-    python src/ingestion.py --path data/raw --out data/chunks --chunk-size 800 --overlap 100
-"""
+# src/ingestion.py
 
 import os
-import sys
+import uuid
 import json
-import argparse
 import hashlib
-from typing import List, Dict, Tuple
+from datetime import datetime
+from pathlib import Path
+from typing import List, Union
 
-import pandas as pd
-import fitz  # pymupdf
-import docx
+from schema_defs import DocumentManifest, TextChunk, sha1_of_text, validate_chunks
 
+# ---------- Paths (robust to where you run from) ----------
+ROOT = Path(__file__).resolve().parents[1]   # expected: /app
+DATA_DIR = ROOT / "data"
+RAW_DIR = DATA_DIR / "raw"
+CHUNKS_DIR = DATA_DIR / "chunks"
 
-# -------------------- Utilities --------------------
+# ---------- utils ----------
+def file_checksum(path: Union[str, Path]) -> str:
+    """Return sha1 checksum of file content."""
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
-ALLOWED_EXTS = {".pdf", ".docx", ".txt", ".csv"}
+def chunk_text(text: str, size: int = 800, overlap: int = 150) -> List[str]:
+    """Split text into chunks safely (no infinite loops on short texts)."""
+    if size <= 0:
+        raise ValueError("size must be > 0")
+    if not (0 <= overlap < size):
+        raise ValueError("overlap must be >= 0 and < size")
 
-def _file_meta(path: str) -> Dict:
-    """Return basic file metadata."""
-    st = os.stat(path)
-    return {
-        "source_path": os.path.abspath(path),
-        "source_name": os.path.basename(path),
-        "size_bytes": st.st_size,
-    }
-
-def _ext(path: str) -> str:
-    return os.path.splitext(path)[1].lower()
-
-def _hash_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
-
-
-# -------------------- Loaders --------------------
-
-def load_pdf(path: str) -> str:
-    """Extract text from a PDF using PyMuPDF."""
-    texts = []
-    with fitz.open(path) as doc:
-        for page in doc:
-            texts.append(page.get_text("text"))
-    return "\n".join(texts)
-
-def load_docx(path: str) -> str:
-    """Extract text from a DOCX using python-docx."""
-    d = docx.Document(path)
-    return "\n".join(p.text for p in d.paragraphs)
-
-def load_txt(path: str) -> str:
-    """Read TXT with reasonable encoding fallbacks (no chardet dependency)."""
-    # Try utf-8 first; if it fails, fallback to common encodings.
-    encodings = ["utf-8", "utf-8-sig", "cp1252", "latin-1"]
-    for enc in encodings:
-        try:
-            with open(path, "r", encoding=enc, errors="strict") as f:
-                return f.read()
-        except Exception:
-            continue
-    # Last-resort: ignore errors
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        return f.read()
-
-def load_csv(path: str) -> str:
-    """
-    Read CSV into DataFrame and serialize back to CSV text.
-    Using sep=None with engine='python' to auto-detect delimiter.
-    """
-    df = pd.read_csv(path, sep=None, engine="python")
-    return df.to_csv(index=False)
-
-def load_file(path: str) -> Tuple[str, Dict]:
-    """Load file by extension and return (text, metadata)."""
-    meta = _file_meta(path)
-    ext = _ext(path)
-    if ext == ".pdf":
-        text = load_pdf(path)
-        meta["filetype"] = "pdf"
-    elif ext == ".docx":
-        text = load_docx(path)
-        meta["filetype"] = "docx"
-    elif ext == ".txt":
-        text = load_txt(path)
-        meta["filetype"] = "txt"
-    elif ext == ".csv":
-        text = load_csv(path)
-        meta["filetype"] = "csv"
-    else:
-        raise ValueError(f"Unsupported file type: {ext}")
-    meta["text_hash"] = _hash_text(text)
-    meta["num_chars"] = len(text)
-    return text, meta
-
-
-# -------------------- Chunker --------------------
-
-def chunk_text(text: str, chunk_size: int = 800, overlap: int = 100) -> List[Dict]:
-    """Split text into overlapping character windows."""
-    if chunk_size <= 0:
-        raise ValueError("chunk_size must be > 0")
-    if not (0 <= overlap < chunk_size):
-        raise ValueError("overlap must be >= 0 and < chunk_size")
-
-    chunks = []
+    chunks: List[str] = []
     n = len(text)
+    if n == 0:
+        return chunks
+
+    step = max(1, size - overlap)  # ensure progress
     start = 0
-    idx = 0
-    step = chunk_size - overlap
-
     while start < n:
-        end = min(start + chunk_size, n)
-        chunk = text[start:end]
-        chunks.append({
-            "text": chunk,
-            "start": start,
-            "end": end,
-            "index": idx
-        })
-        idx += 1
+        end = min(start + size, n)
+        chunks.append(text[start:end])
+        if end >= n:
+            break
         start += step
-
     return chunks
 
+# ---------- ingestion ----------
+def ingest_file(path: Union[str, Path], out_dir: Path = CHUNKS_DIR) -> None:
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-# -------------------- Persist --------------------
+    fpath = Path(path)
+    ext = fpath.suffix.lower().lstrip(".")
+    stat = fpath.stat()
+    doc_id = str(uuid.uuid4())
+    checksum = file_checksum(fpath)
 
-def save_chunks_jsonl(chunks: List[Dict], meta: Dict, out_dir: str) -> str:
-    """
-    Save chunks as JSONL with metadata per line.
-    Returns the output file path.
-    """
-    os.makedirs(out_dir, exist_ok=True)
-    base = os.path.splitext(meta["source_name"])[0]
-    # unique name based on content hash to avoid collisions
-    out_path = os.path.join(out_dir, f"{base}__{meta['text_hash'][:12]}.jsonl")
-
-    with open(out_path, "w", encoding="utf-8") as f:
-        for c in chunks:
-            row = {
-                "text": c["text"],
-                "chunk_index": c["index"],
-                "char_range": [c["start"], c["end"]],
-                "metadata": meta,
-            }
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-    return out_path
-
-
-# -------------------- Runner --------------------
-
-def iter_input_paths(path: str):
-    """Yield file paths from a single file or recursively from a directory."""
-    if os.path.isfile(path):
-        yield path
+    # load raw text (txt for now; extend later for pdf/docx)
+    if ext == "txt":
+        text = fpath.read_text(encoding="utf-8", errors="ignore")
+        mime = "text/plain"
+        page_start = None
+        page_end = None
     else:
-        for root, _, files in os.walk(path):
-            for name in files:
-                p = os.path.join(root, name)
-                if _ext(p) in ALLOWED_EXTS:
-                    yield p
+        raise NotImplementedError(f"Extension {ext} not supported yet")
 
-def main():
-    parser = argparse.ArgumentParser(description="Ingest and chunk files.")
-    parser.add_argument("--path", required=True, help="File or directory to ingest (e.g., data/raw or data/raw/sample.txt)")
-    parser.add_argument("--out", default="data/chunks", help="Output directory for JSONL chunks")
-    parser.add_argument("--chunk-size", type=int, default=800, help="Chunk size (characters)")
-    parser.add_argument("--overlap", type=int, default=100, help="Chunk overlap (characters)")
-    parser.add_argument("--preview", action="store_true", help="Print a short preview for sanity check")
-    args = parser.parse_args()
+    # chunking
+    size = 800
+    overlap = 150
+    raw_chunks = chunk_text(text, size=size, overlap=overlap)
 
-    total_files = 0
-    total_chunks = 0
+    text_chunks: List[TextChunk] = []
+    step = max(1, size - overlap)
+    for idx, chunk in enumerate(raw_chunks):
+        ch_id = f"{doc_id}:{idx:04d}"
+        start_char = idx * step
+        end_char = start_char + len(chunk)
+        text_chunks.append(
+            TextChunk(
+                id=ch_id,
+                doc_id=doc_id,
+                chunk_idx=idx,
+                text=chunk,
+                n_chars=len(chunk),
+                start_char=start_char,
+                end_char=end_char,
+                overlap=overlap,
+                source={
+                    "path": str(fpath),
+                    "page_start": page_start,
+                    "page_end": page_end,
+                    "mime": mime,
+                },
+                checksum=sha1_of_text(chunk),
+            )
+        )
 
-    for fp in iter_input_paths(args.path):
-        total_files += 1
-        text, meta = load_file(fp)
-        chunks = chunk_text(text, chunk_size=args.chunk_size, overlap=args.overlap)
-        out_file = save_chunks_jsonl(chunks, meta, args.out)
-        total_chunks += len(chunks)
+    validate_chunks(text_chunks)
 
-        print(f"✅ Ingested: {fp}")
-        print(f"   chars={meta['num_chars']}  chunks={len(chunks)}  -> {out_file}")
-        if args.preview and chunks:
-            preview = chunks[0]["text"][:200].replace("\n", " ")
-            print(f"   preview: {preview} ...")
+    # write chunks.jsonl
+    chunks_path = out_dir / "chunks.jsonl"
+    with chunks_path.open("a", encoding="utf-8") as f:
+        for ch in text_chunks:
+            f.write(json.dumps(ch.__dict__, ensure_ascii=False) + "\n")
 
-    print(f"\n🏁 Done. files={total_files}, chunks={total_chunks}, out_dir={args.out}")
+    # write manifest.jsonl
+    manifest_path = out_dir / "manifest.jsonl"
+    manifest = DocumentManifest(
+        doc_id=doc_id,
+        path=str(fpath),
+        ext=ext,
+        size_bytes=stat.st_size,
+        mtime=datetime.utcfromtimestamp(stat.st_mtime).isoformat(),
+        checksum=checksum,
+        num_chunks=len(text_chunks),
+        pages=None,
+        ingested_at=datetime.utcnow().isoformat(),
+    )
+    with manifest_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(manifest.__dict__, ensure_ascii=False) + "\n")
 
+    print(f"Ingested {fpath} → {len(text_chunks)} chunks")
+    print(f"Wrote: {chunks_path} , {manifest_path}")
+
+# ---------- demo run ----------
 if __name__ == "__main__":
-    main()
+    demo_file = RAW_DIR / "demo.txt"   # => /app/data/raw/demo.txt
+    if demo_file.exists():
+        ingest_file(demo_file)
+    else:
+        print("No demo file found at", demo_file)
