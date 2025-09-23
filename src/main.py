@@ -1,16 +1,21 @@
-# src/main.py
 from fastapi import FastAPI, HTTPException, UploadFile, File, Query
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
-import os, json, subprocess, uuid, time
+import os, json, subprocess, uuid
 from pathlib import Path
 from datetime import datetime
 
 import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
+from src.loaders import load_any_bytes
+from src.chunking import chunk_text_smart  # NEW
 
-app = FastAPI(title="Local RAG", version="0.2.0")
+
+
+
+
+app = FastAPI(title="Local RAG", version="0.3.0")
 
 # ---------- Config ----------
 INDEX_PATH = os.environ.get("RAG_FAISS_INDEX", "data/index/faiss.index")
@@ -21,7 +26,7 @@ CHUNKS_DIR = "data/chunks"
 CHUNKS_PATH = f"{CHUNKS_DIR}/chunks.jsonl"
 MANIFEST_PATH = f"{CHUNKS_DIR}/manifest.jsonl"
 
-# ---------- Globals (loaded once) ----------
+# ---------- Globals ----------
 _model: Optional[SentenceTransformer] = None
 _index: Optional[faiss.Index] = None
 _meta: List[dict] = []
@@ -43,9 +48,9 @@ class SearchOut(BaseModel):
     results: List[Hit]
 
 class ReindexIn(BaseModel):
-    input_dir: str = Field(default="data/chunks", description="Path to chunked JSONL dir")
-    output_dir: str = Field(default="data/index", description="Output dir for FAISS+meta")
-    batch: int = Field(default=32, ge=1, le=1024, description="Batch size for embeddings")
+    input_dir: str = Field(default="data/chunks")
+    output_dir: str = Field(default="data/index")
+    batch: int = Field(default=32, ge=1, le=1024)
 
 class ReindexOut(BaseModel):
     status: str
@@ -66,6 +71,8 @@ class UploadOut(BaseModel):
 # ---------- Utils ----------
 def _load_meta(path: str) -> List[dict]:
     out = []
+    if not os.path.exists(path):
+        return out
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -74,7 +81,6 @@ def _load_meta(path: str) -> List[dict]:
     return out
 
 def _encode_query(text: str) -> np.ndarray:
-    # L2-normalized embeddings (cosine via Inner Product)
     q = _model.encode([text], show_progress_bar=False, convert_to_numpy=True, normalize_embeddings=True)
     return q.astype("float32")
 
@@ -85,16 +91,15 @@ def _ensure_dirs() -> None:
 
 def _slugify(name: str) -> str:
     keep = []
-    for ch in name:
+    for ch in name or "":
         if ch.isalnum() or ch in ("-", "_", "."):
             keep.append(ch)
         else:
             keep.append("_")
-    s = "".join(keep)
-    # avoid leading dots
+    s = "".join(keep) or "file"
     while s.startswith("."):
         s = "_" + s[1:]
-    return s or "file"
+    return s
 
 def _now_iso() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
@@ -104,21 +109,18 @@ def _append_jsonl(path: str, record: Dict[str, Any]) -> None:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 def _chunk_text(text: str, size: int = 800, overlap: int = 200) -> List[str]:
-    # simple char-based chunking with overlap
     chunks = []
     n = len(text)
+    if n == 0:
+        return chunks
+    step = max(1, size - overlap)
     start = 0
     while start < n:
         end = min(n, start + size)
-        chunk = text[start:end]
-        chunks.append(chunk)
-        if end == n:
+        chunks.append(text[start:end])
+        if end >= n:
             break
-        start = end - overlap
-        if start < 0:
-            start = 0
-        if start >= n:
-            break
+        start += step
     return chunks
 
 def _run_reindex(input_dir: str = "data/chunks", output_dir: str = "data/index", batch: int = 32) -> str:
@@ -137,31 +139,19 @@ def _reload_index_and_meta() -> None:
     global _index, _meta
     if os.path.exists(INDEX_PATH):
         _index = faiss.read_index(INDEX_PATH)
-    if os.path.exists(META_PATH):
-        _meta = _load_meta(META_PATH)
+    else:
+        _index = None
+    _meta = _load_meta(META_PATH)
 
 # ---------- Lifecycle ----------
 @app.on_event("startup")
 def on_startup():
     global _model, _index, _meta
     _ensure_dirs()
-    # Load model
     _model = SentenceTransformer(MODEL_NAME)
-    # Load index
-    if not os.path.exists(INDEX_PATH):
-        # allow startup without index yet
-        print(f"[WARN] FAISS index not found at startup: {INDEX_PATH}")
-    else:
+    if os.path.exists(INDEX_PATH):
         _index = faiss.read_index(INDEX_PATH)
-    # Load meta
-    if not os.path.exists(META_PATH):
-        print(f"[WARN] Meta JSONL not found at startup: {META_PATH}")
-    else:
-        _meta = _load_meta(META_PATH)
-    if _index is not None and _meta:
-        if _index.ntotal != len(_meta):
-            print(f"[WARN] index vectors ({_index.ntotal}) != meta rows ({len(_meta)})")
-        print(f"[READY] model={MODEL_NAME}  vectors={_index.ntotal}")
+    _meta = _load_meta(META_PATH)
 
 # ---------- Routes ----------
 @app.get("/ping")
@@ -205,59 +195,55 @@ def reindex(body: ReindexIn):
         out = _run_reindex(body.input_dir, body.output_dir, body.batch)
     except Exception as e:
         raise HTTPException(500, f"Reindex failed:\n{e}")
-
     _reload_index_and_meta()
     tail = "\n".join(out.strip().splitlines()[-10:])
-    return ReindexOut(
-        status="ok",
-        input_dir=body.input_dir,
-        output_dir=body.output_dir,
-        batch=body.batch,
-        stdout_tail=tail,
-    )
+    return ReindexOut(status="ok", input_dir=body.input_dir, output_dir=body.output_dir, batch=body.batch, stdout_tail=tail)
 
+# ------------ UPDATED: /upload supports txt/pdf/docx/csv -------------
 @app.post("/upload", response_model=UploadOut)
-async def upload_txt(file: UploadFile = File(...), reindex: bool = Query(default=False)):
-    # Only text/plain for this step
-    if file.content_type not in ("text/plain", "application/octet-stream"):
-        raise HTTPException(400, "Only text files are accepted in this step")
-
+async def upload_any(
+    file: UploadFile = File(...),
+    reindex: bool = Query(default=False),
+    ocr: bool = Query(default=False, description="Use OCR fallback for PDFs"),
+):
     _ensure_dirs()
 
-    # Save raw file
-    raw_name = _slugify(file.filename or "upload.txt")
+    # Determine extension
+    original = _slugify(file.filename or "upload")
+    ext = Path(original).suffix.lower()
+    if ext not in (".txt", ".pdf", ".docx", ".csv"):
+        raise HTTPException(400, "Only .txt, .pdf, .docx, .csv are accepted")
+
+    # Save raw bytes with unique name
     doc_id = str(uuid.uuid4())
-    unique_name = f"{Path(raw_name).stem}__{doc_id}.txt"
+    unique_name = f"{Path(original).stem}__{doc_id}{ext}"
     raw_path = Path(RAW_DIR) / unique_name
-
     data = await file.read()
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError:
-        # fallback latin-1 to avoid crash on odd encodings
-        text = data.decode("latin-1")
-
-    with open(raw_path, "w", encoding="utf-8") as f:
-        f.write(text)
-
+    with open(raw_path, "wb") as f:
+        f.write(data)
     size_bytes = raw_path.stat().st_size
 
-    # Chunk & append to chunks.jsonl + manifest.jsonl
-    chunks = _chunk_text(text, size=800, overlap=200)
+    # Extract text via loaders
+    text = load_any_bytes(data, ext=ext.lstrip("."), ocr=ocr)
+    if not text.strip():
+        raise HTTPException(400, "No extractable text from file")
+
+    # Chunk & append to JSONLs
+    chunks = chunk_text_smart(text, ext.lstrip("."))
     created_at = _now_iso()
 
-    # manifest row
     manifest_row = {
         "doc_id": doc_id,
         "path": str(raw_path),
-        "filename": raw_name,
+        "filename": original,
+        "ext": ext.lstrip("."),
         "size_bytes": size_bytes,
         "n_chunks": len(chunks),
         "created_at": created_at,
+        "source_type": ext.lstrip("."),
     }
     _append_jsonl(MANIFEST_PATH, manifest_row)
 
-    # chunk rows
     for i, t in enumerate(chunks):
         row = {
             "id": f"{doc_id}:{i:04d}",
@@ -266,13 +252,13 @@ async def upload_txt(file: UploadFile = File(...), reindex: bool = Query(default
             "text": t,
             "path": str(raw_path),
             "created_at": created_at,
+            "source_type": ext.lstrip("."),
         }
         _append_jsonl(CHUNKS_PATH, row)
 
     did_reindex = False
     tail = None
     if reindex:
-        # rebuild index and reload
         try:
             out = _run_reindex(input_dir=CHUNKS_DIR, output_dir=os.path.dirname(INDEX_PATH), batch=32)
             _reload_index_and_meta()
