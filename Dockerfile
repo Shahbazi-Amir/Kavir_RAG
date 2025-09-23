@@ -1,27 +1,35 @@
 # Use official Python 3.11 slim image
 FROM python:3.11-slim
 
-# System dependencies: Tesseract (+languages) and Poppler for pdf2image
+# --- Environment for reliable, quiet pip ---
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HF_HOME=/root/.cache/huggingface
+
+# --- System deps: Tesseract (fa, eng, osd) + Poppler for pdf2image + build essentials if wheels missing ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr tesseract-ocr-eng tesseract-ocr-osd tesseract-ocr-fas \
-    poppler-utils build-essential \
-    && rm -rf /var/lib/apt/lists/*
+    poppler-utils \
+    build-essential \
+    git \
+ && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
 WORKDIR /app
 
-# Set HuggingFace cache directory
-ENV HF_HOME=/root/.cache/huggingface
-
-# Install Python dependencies (cached if requirements.txt unchanged)
+# --- Copy only requirements first to maximize layer cache ---
 COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy source code last (so code changes don't invalidate deps cache)
+# --- Install Python deps with BuildKit cache (enable with DOCKER_BUILDKIT=1) ---
+# This keeps pip cache between builds so dependency layer is fast if requirements.txt unchanged
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-cache-dir -r /app/requirements.txt
+
+# --- Copy source last so changes here don't invalidate deps cache ---
 COPY src/ /app/src
 
-# Expose port
+# Expose API port
 EXPOSE 8000
 
-# Run FastAPI app with uvicorn
+# Default command for dev; we'll still run via docker run
 CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
