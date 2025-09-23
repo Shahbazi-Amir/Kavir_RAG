@@ -1,8 +1,8 @@
 # src/main.py
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional
-import os, json
+import os, json, subprocess
 import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
@@ -34,6 +34,18 @@ class Hit(BaseModel):
 
 class SearchOut(BaseModel):
     results: List[Hit]
+
+class ReindexIn(BaseModel):
+    input_dir: str = Field(default="data/chunks", description="Path to chunked JSONL dir")
+    output_dir: str = Field(default="data/index", description="Output dir for FAISS+meta")
+    batch: int = Field(default=32, ge=1, le=1024, description="Batch size for embeddings")
+
+class ReindexOut(BaseModel):
+    status: str
+    input_dir: str
+    output_dir: str
+    batch: int
+    stdout_tail: str
 
 # ---------- Utils ----------
 def _load_meta(path: str) -> List[dict]:
@@ -104,3 +116,39 @@ def query(body: QueryIn):
             text_preview=text
         ))
     return SearchOut(results=results)
+
+@app.post("/reindex", response_model=ReindexOut)
+def reindex(body: ReindexIn):
+    # Run embeddings script as a subprocess inside this container
+    # embeddings.py خودش قبل از نوشتن، بکاپ می‌سازد.
+    cmd = [
+        "python", "-u", "/app/src/embeddings.py",
+        "--input", f"/app/{body.input_dir}" if not body.input_dir.startswith("/") else body.input_dir,
+        "--out",   f"/app/{body.output_dir}" if not body.output_dir.startswith("/") else body.output_dir,
+        "--batch", str(body.batch),
+    ]
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, check=True
+        )
+    except subprocess.CalledProcessError as e:
+        err = (e.stdout or "") + "\n" + (e.stderr or "")
+        raise HTTPException(500, f"Reindex failed:\n{err.strip()}")
+
+    # Reload index + meta into memory so /query بلافاصله با ایندکس جدید کار کند
+    global _index, _meta
+    if os.path.exists(INDEX_PATH):
+        _index = faiss.read_index(INDEX_PATH)
+    if os.path.exists(META_PATH):
+        _meta = _load_meta(META_PATH)
+
+    out_text = proc.stdout.strip().splitlines()
+    tail = "\n".join(out_text[-10:]) if out_text else ""  # آخرین ۱۰ خط لاگ
+
+    return ReindexOut(
+        status="ok",
+        input_dir=body.input_dir,
+        output_dir=body.output_dir,
+        batch=body.batch,
+        stdout_tail=tail,
+    )
