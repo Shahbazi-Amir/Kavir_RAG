@@ -36,3 +36,12 @@ logs/
 
 # Docker
 *.pid
+
+
+# data
+data/raw/
+data/chunks/
+data/index/
+data/fonts/
+.root/.cache/
+.cache/
