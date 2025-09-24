@@ -18,6 +18,7 @@ def load_txt_bytes(b: bytes, encoding: str = "utf-8") -> str:
 
 def load_pdf_bytes(b: bytes, ocr: bool = False) -> str:
     # 1) Try PyMuPDF (fitz) first — best for mixed/RTL text
+    print(">>> load_pdf_bytes called, ocr=", ocr)   # DEBUG
     try:
         import fitz  # PyMuPDF
         text_parts = []
