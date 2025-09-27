@@ -9,7 +9,7 @@ import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from src.loaders import load_any_bytes
-from src.chunking import chunk_text_smart  # NEW
+from src.chunking import chunk_text_smart, choose_chunk_params  # NEW
 
 
 
@@ -206,15 +206,16 @@ async def upload_any(
     reindex: bool = Query(default=False),
     ocr: bool = Query(default=False, description="Use OCR fallback for PDFs"),
 ):
+    # Ensure dirs
     _ensure_dirs()
 
-    # Determine extension
+    # Resolve extension
     original = _slugify(file.filename or "upload")
     ext = Path(original).suffix.lower()
     if ext not in (".txt", ".pdf", ".docx", ".csv"):
         raise HTTPException(400, "Only .txt, .pdf, .docx, .csv are accepted")
 
-    # Save raw bytes with unique name
+    # Save raw bytes
     doc_id = str(uuid.uuid4())
     unique_name = f"{Path(original).stem}__{doc_id}{ext}"
     raw_path = Path(RAW_DIR) / unique_name
@@ -223,15 +224,18 @@ async def upload_any(
         f.write(data)
     size_bytes = raw_path.stat().st_size
 
-    # Extract text via loaders
+    # Extract text
     text = load_any_bytes(data, ext=ext.lstrip("."), ocr=ocr)
     if not text.strip():
         raise HTTPException(400, "No extractable text from file")
 
-    # Chunk & append to JSONLs
+    # Smart chunking + record chosen params
+    size, overlap = choose_chunk_params(ext.lstrip("."), text)
     chunks = chunk_text_smart(text, ext.lstrip("."))
+
     created_at = _now_iso()
 
+    # Manifest row (now includes chunk params)
     manifest_row = {
         "doc_id": doc_id,
         "path": str(raw_path),
@@ -241,9 +245,12 @@ async def upload_any(
         "n_chunks": len(chunks),
         "created_at": created_at,
         "source_type": ext.lstrip("."),
+        "chunk_size": size,
+        "chunk_overlap": overlap,
     }
     _append_jsonl(MANIFEST_PATH, manifest_row)
 
+    # Chunk rows
     for i, t in enumerate(chunks):
         row = {
             "id": f"{doc_id}:{i:04d}",
@@ -256,6 +263,7 @@ async def upload_any(
         }
         _append_jsonl(CHUNKS_PATH, row)
 
+    # Optional reindex
     did_reindex = False
     tail = None
     if reindex:
@@ -276,3 +284,4 @@ async def upload_any(
         reindexed=did_reindex,
         reindex_log_tail=tail,
     )
+

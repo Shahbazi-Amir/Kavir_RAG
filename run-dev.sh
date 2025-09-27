@@ -25,3 +25,6 @@ docker run --rm -it \
   -v "$(pwd)/.cache/hf:/root/.cache/huggingface" \
   --name rag-dev \
   rag-local
+
+
+
