@@ -1,7 +1,14 @@
+# main.py — Full overwrite with RAG + /chat integration (CPU-only llama.cpp)
+# Notes (EN):
+# - Keeps your existing RAG: /ping, /query, /reindex, /upload
+# - Adds /chat with persistent llama.cpp session via pexpect
+# - Optional RAG context in /chat using top-k chunks (configurable)
+# - Tuned for MacBook Pro 2015: -ngl 0, no warmup, short outputs by default
+
 from fastapi import FastAPI, HTTPException, UploadFile, File, Query
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
-import os, json, subprocess, uuid
+import os, json, subprocess, uuid, asyncio, pexpect
 from pathlib import Path
 from datetime import datetime
 
@@ -11,11 +18,7 @@ from sentence_transformers import SentenceTransformer
 from src.loaders import load_any_bytes
 from src.chunking import chunk_text_smart, choose_chunk_params  # NEW
 
-
-
-
-
-app = FastAPI(title="Local RAG", version="0.3.0")
+app = FastAPI(title="Local RAG", version="0.4.0")
 
 # ---------- Config ----------
 INDEX_PATH = os.environ.get("RAG_FAISS_INDEX", "data/index/faiss.index")
@@ -26,10 +29,23 @@ CHUNKS_DIR = "data/chunks"
 CHUNKS_PATH = f"{CHUNKS_DIR}/chunks.jsonl"
 MANIFEST_PATH = f"{CHUNKS_DIR}/manifest.jsonl"
 
+# llama.cpp config (CPU-only for MBP2015)
+LLAMA_BIN   = os.getenv("LLAMA_BIN", "llama.cpp/build/bin/llama-cli")
+MODEL_PATH  = os.getenv("LLAMA_MODEL", "data/models/qwen2-7b-instruct-q4_k_m.gguf")
+LLAMA_ARGS  = [
+    LLAMA_BIN, "--model", MODEL_PATH,
+    "-c", "768", "-n", "48", "-t", "4", "-b", "128",
+    "-ngl", "0", "--no-warmup", "--interactive-first", "--color", "never"
+]
+MAX_CTX_DOC_CHARS = int(os.getenv("CHAT_CTX_MAX_CHARS", "1600"))  # cap context size
+
 # ---------- Globals ----------
 _model: Optional[SentenceTransformer] = None
 _index: Optional[faiss.Index] = None
 _meta: List[dict] = []
+
+_llama_lock = asyncio.Lock()
+_llama_sess: Optional[pexpect.spawnbase.SpawnBase] = None
 
 # ---------- Schemas ----------
 class QueryIn(BaseModel):
@@ -67,6 +83,14 @@ class UploadOut(BaseModel):
     n_chunks: int
     reindexed: bool = False
     reindex_log_tail: Optional[str] = None
+
+class ChatIn(BaseModel):
+    prompt: str
+    system: Optional[str] = None
+    max_new_tokens: Optional[int] = None
+    use_rag: bool = True          # attach RAG context
+    rag_k: int = 3                # how many chunks to attach
+    language: Optional[str] = None  # force response language if desired (e.g., "fa")
 
 # ---------- Utils ----------
 def _load_meta(path: str) -> List[dict]:
@@ -108,21 +132,6 @@ def _append_jsonl(path: str, record: Dict[str, Any]) -> None:
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-def _chunk_text(text: str, size: int = 800, overlap: int = 200) -> List[str]:
-    chunks = []
-    n = len(text)
-    if n == 0:
-        return chunks
-    step = max(1, size - overlap)
-    start = 0
-    while start < n:
-        end = min(n, start + size)
-        chunks.append(text[start:end])
-        if end >= n:
-            break
-        start += step
-    return chunks
-
 def _run_reindex(input_dir: str = "data/chunks", output_dir: str = "data/index", batch: int = 32) -> str:
     cmd = [
         "python", "-u", "/app/src/embeddings.py",
@@ -142,6 +151,58 @@ def _reload_index_and_meta() -> None:
     else:
         _index = None
     _meta = _load_meta(META_PATH)
+
+# llama helpers
+def _spawn_llama(max_new_tokens: Optional[int] = None):
+    global _llama_sess
+    args = LLAMA_ARGS[:]
+    if max_new_tokens:
+        # override -n on demand
+        for i,a in enumerate(args):
+            if a == "-n" and i+1 < len(args):
+                args[i+1] = str(max_new_tokens); break
+    if _llama_sess is None or not _llama_sess.isalive():
+        _llama_sess = pexpect.spawn(" ".join(args), encoding="utf-8", timeout=120)
+        _llama_sess.expect("interactive mode")
+
+def _format_chat(system: Optional[str], user: str, ctx_text: Optional[str], language: Optional[str]) -> str:
+    # Minimal template: system + optional RAG context + user instruction
+    today = datetime.utcnow().date().isoformat()
+    sysmsg = (system or f"You are concise. Keep answers short. Date: {today}").strip()
+    lang_hint = f" Respond in {language}." if language else ""
+    ctx_block = f"\n\n<<CONTEXT>>\n{ctx_text}\n<</CONTEXT>>" if ctx_text else ""
+    return f"<<SYS>>\n{sysmsg}{lang_hint}\n<</SYS>>{ctx_block}\n\nUser: {user}\nAssistant:"
+
+def _llama_ask(prompt_text: str) -> str:
+    _llama_sess.sendline(prompt_text)
+    _llama_sess.expect("Assistant:")
+    # Read until model yields control; simple heuristics for pause
+    _llama_sess.expect(["\nUser:", "interactive mode", pexpect.TIMEOUT, pexpect.EOF], timeout=30)
+    return (_llama_sess.before or "").strip()
+
+def _build_rag_context(query_text: str, k: int) -> str:
+    if _index is None or not _meta:
+        return ""
+    q = _encode_query(query_text)
+    k = max(1, min(k, 10))
+    scores, ids = _index.search(q, k)
+    ids = ids[0].tolist()
+    pieces = []
+    budget = MAX_CTX_DOC_CHARS
+    for idx in ids:
+        if idx == -1: 
+            continue
+        if 0 <= idx < len(_meta):
+            t = (_meta[idx].get("text") or "").strip()
+            if not t:
+                continue
+            # append with simple budget cap
+            take = t[: min(len(t), budget)]
+            pieces.append(take)
+            budget -= len(take)
+            if budget <= 0:
+                break
+    return "\n---\n".join(pieces).strip()
 
 # ---------- Lifecycle ----------
 @app.on_event("startup")
@@ -199,23 +260,20 @@ def reindex(body: ReindexIn):
     tail = "\n".join(out.strip().splitlines()[-10:])
     return ReindexOut(status="ok", input_dir=body.input_dir, output_dir=body.output_dir, batch=body.batch, stdout_tail=tail)
 
-# ------------ UPDATED: /upload supports txt/pdf/docx/csv -------------
+# ------------ /upload (txt/pdf/docx/csv) -------------
 @app.post("/upload", response_model=UploadOut)
 async def upload_any(
     file: UploadFile = File(...),
     reindex: bool = Query(default=False),
     ocr: bool = Query(default=False, description="Use OCR fallback for PDFs"),
 ):
-    # Ensure dirs
     _ensure_dirs()
 
-    # Resolve extension
     original = _slugify(file.filename or "upload")
     ext = Path(original).suffix.lower()
     if ext not in (".txt", ".pdf", ".docx", ".csv"):
         raise HTTPException(400, "Only .txt, .pdf, .docx, .csv are accepted")
 
-    # Save raw bytes
     doc_id = str(uuid.uuid4())
     unique_name = f"{Path(original).stem}__{doc_id}{ext}"
     raw_path = Path(RAW_DIR) / unique_name
@@ -224,18 +282,15 @@ async def upload_any(
         f.write(data)
     size_bytes = raw_path.stat().st_size
 
-    # Extract text
     text = load_any_bytes(data, ext=ext.lstrip("."), ocr=ocr)
     if not text.strip():
         raise HTTPException(400, "No extractable text from file")
 
-    # Smart chunking + record chosen params
     size, overlap = choose_chunk_params(ext.lstrip("."), text)
     chunks = chunk_text_smart(text, ext.lstrip("."))
 
     created_at = _now_iso()
 
-    # Manifest row (now includes chunk params)
     manifest_row = {
         "doc_id": doc_id,
         "path": str(raw_path),
@@ -250,7 +305,6 @@ async def upload_any(
     }
     _append_jsonl(MANIFEST_PATH, manifest_row)
 
-    # Chunk rows
     for i, t in enumerate(chunks):
         row = {
             "id": f"{doc_id}:{i:04d}",
@@ -263,7 +317,6 @@ async def upload_any(
         }
         _append_jsonl(CHUNKS_PATH, row)
 
-    # Optional reindex
     did_reindex = False
     tail = None
     if reindex:
@@ -285,3 +338,18 @@ async def upload_any(
         reindex_log_tail=tail,
     )
 
+# ------------ NEW: /chat -------------
+@app.post("/chat")
+async def chat(body: ChatIn):
+    if not body.prompt.strip():
+        raise HTTPException(400, "Empty prompt")
+    # Optional RAG context
+    ctx = _build_rag_context(body.prompt, body.rag_k) if body.use_rag else ""
+    async with _llama_lock:
+        try:
+            _spawn_llama(body.max_new_tokens)
+            prompt = _format_chat(body.system, body.prompt, ctx, body.language)
+            answer = _llama_ask(prompt)
+            return {"answer": answer, "used_rag": body.use_rag, "rag_chars": len(ctx)}
+        except Exception as e:
+            raise HTTPException(500, f"chat failed: {e}")
