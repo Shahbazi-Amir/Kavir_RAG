@@ -11,7 +11,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     poppler-utils \
     build-essential \
     git \
+    cmake \
  && rm -rf /var/lib/apt/lists/*
+
 
 WORKDIR /app
 
