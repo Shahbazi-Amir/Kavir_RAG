@@ -151,29 +151,40 @@ def _format_chat(system: Optional[str], user: str, ctx_text: Optional[str], lang
     return f"<<SYS>>\n{sysmsg}{lang_hint}\n<</SYS>>{ctx_block}\n\nUser: {user}\nAssistant:"
 
 def _llama_ask(prompt_text: str) -> str:
+    # send the prompt to the interactive llama session
     _llama_sess.sendline(prompt_text)
+
+    # wait until the assistant turn is prompted
     _llama_sess.expect("Assistant:")
-    _llama_sess.expect(["\nUser:", "interactive mode", pexpect.TIMEOUT, pexpect.EOF], timeout=30)
-    raw = (_llama_sess.before or "").strip()
 
-    # خطوط را جدا کن
-    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-    if not lines:
-        return raw
+    # eat optional role label line like '\nassistant\n' (case-insensitive) if printed by llama-cli
+    try:
+        _llama_sess.expect([r"\r?\nassistant\r?\n", r"\r?\nAssistant\r?\n"], timeout=1)
+    except pexpect.TIMEOUT:
+        pass
 
-    # آخرین خط معمولاً پاسخ مدل است
-    answer = lines[-1]
+    # read until next user prompt or interactive mode banner (end of assistant turn)
+    _llama_sess.expect(["\nUser:", "interactive mode", pexpect.EOF, pexpect.TIMEOUT], timeout=30)
 
-    # اگر هنوز 'assistant' تکراری بود، حذفش کن
-    if answer.lower().startswith("assistant"):
-        if len(lines) > 1:
-            answer = lines[-2] if not lines[-2].lower().startswith("assistant") else lines[-1]
-        else:
-            answer = answer.replace("assistant", "", 1).strip()
+    raw = (_llama_sess.before or "")
 
-    return answer.strip()
+    # cleanup: drop empty lines, '>' prompts, role echoes, and 'EOF by user'
+    lines = [ln.strip() for ln in raw.splitlines()]
+    cleaned = []
+    for ln in lines:
+        low = ln.lower()
+        if not ln:
+            continue
+        if ln == ">":
+            continue
+        if "eof by user" in low:
+            continue
+        if low.startswith("assistant"):
+            continue
+        cleaned.append(ln)
 
-
+    answer = "\n".join(cleaned).strip()
+    return answer if answer else raw.strip()
 
 
 
