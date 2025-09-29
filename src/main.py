@@ -167,6 +167,14 @@ def _format_chat(system: Optional[str], user: str, ctx_text: Optional[str], lang
     )
 
 
+def clean_answer(raw: str) -> str:
+    # remove special tokens and extra prompts
+    txt = re.sub(r"<\|im_start\|>.*?<\|im_end\|>", "", raw, flags=re.DOTALL)
+    txt = re.sub(r"<\|.*?\|>", "", txt)   # remove leftover tags like <|endoftext|>
+    txt = re.sub(r"^>+\s*", "", txt, flags=re.MULTILINE)  # remove ">" artifacts
+    txt = txt.strip()
+    return txt
+
 def _llama_ask(prompt_text: str, max_new_tokens: int = 48) -> str:
     args = [
         LLAMA_BIN, "--model", MODEL_PATH,
@@ -178,9 +186,8 @@ def _llama_ask(prompt_text: str, max_new_tokens: int = 48) -> str:
     if proc.returncode != 0:
         raise RuntimeError(f"llama-cli failed:\n{proc.stderr}")
     out = proc.stdout.strip()
-    # keep only last non-empty lines (model answer)
-    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
-    return lines[-1] if lines else out
+    return clean_answer(out)
+
 
 
 
