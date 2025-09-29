@@ -145,46 +145,41 @@ def _spawn_llama(max_new_tokens: Optional[int] = None):
         _llama_sess.expect("interactive mode")
 
 def _format_chat(system: Optional[str], user: str, ctx_text: Optional[str], language: Optional[str]) -> str:
-    sysmsg = (system or f"You are concise. Keep answers short. Date: {datetime.utcnow().date().isoformat()}").strip()
+    # Qwen2 chat template (from GGUF metadata)
+    sysmsg = (system or "You are a helpful assistant.").strip()
     lang_hint = f" Respond in {language}." if language else ""
-    ctx_block = f"\n\n<<CONTEXT>>\n{ctx_text}\n<</CONTEXT>>" if ctx_text else ""
-    return f"<<SYS>>\n{sysmsg}{lang_hint}\n<</SYS>>{ctx_block}\n\nUser: {user}\nAssistant:"
+    ctx_block = f"\nContext:\n{ctx_text}\n" if ctx_text else ""
 
-def _llama_ask(prompt_text: str) -> str:
-    # send the prompt to the interactive llama session
-    _llama_sess.sendline(prompt_text)
+    return (
+        f"<|im_start|>system\n"
+        f"{sysmsg}{lang_hint}{ctx_block}<|im_end|>\n"
+        f"<|im_start|>user\n"
+        f"{user}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
 
-    # wait until the assistant turn is prompted
-    _llama_sess.expect("Assistant:")
 
-    # eat optional role label line like '\nassistant\n' (case-insensitive) if printed by llama-cli
-    try:
-        _llama_sess.expect([r"\r?\nassistant\r?\n", r"\r?\nAssistant\r?\n"], timeout=1)
-    except pexpect.TIMEOUT:
-        pass
+def _llama_ask(prompt_text: str, max_new_tokens: int = 48) -> str:
+    args = [
+        LLAMA_BIN, "--model", MODEL_PATH,
+        "-c", "768", "-n", str(max_new_tokens), "-t", "4", "-b", "128",
+        "-ngl", "0", "--no-warmup",
+        "-p", prompt_text
+    ]
+    proc = subprocess.run(args, capture_output=True, text=True, timeout=180)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr or "llama-cli failed")
 
-    # read until next user prompt or interactive mode banner (end of assistant turn)
-    _llama_sess.expect(["\nUser:", "interactive mode", pexpect.EOF, pexpect.TIMEOUT], timeout=30)
+    out = proc.stdout.strip()
 
-    raw = (_llama_sess.before or "")
+    # Clean output: remove template tags if present
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    if not lines:
+        return out
+    return lines[-1]
 
-    # cleanup: drop empty lines, '>' prompts, role echoes, and 'EOF by user'
-    lines = [ln.strip() for ln in raw.splitlines()]
-    cleaned = []
-    for ln in lines:
-        low = ln.lower()
-        if not ln:
-            continue
-        if ln == ">":
-            continue
-        if "eof by user" in low:
-            continue
-        if low.startswith("assistant"):
-            continue
-        cleaned.append(ln)
 
-    answer = "\n".join(cleaned).strip()
-    return answer if answer else raw.strip()
+
 
 
 
