@@ -10,6 +10,8 @@ from typing import List, Optional, Dict, Any
 import os, json, subprocess, uuid, asyncio, pexpect, re
 from pathlib import Path
 from datetime import datetime
+import requests
+
 
 import faiss
 import numpy as np
@@ -30,11 +32,17 @@ MANIFEST_PATH = f"{CHUNKS_DIR}/manifest.jsonl"
 
 LLAMA_BIN   = os.getenv("LLAMA_BIN", "llama.cpp/build/bin/llama-cli")
 MODEL_PATH  = os.getenv("LLAMA_MODEL", "data/models/qwen2-7b-instruct-q4_k_m.gguf")
-LLAMA_ARGS  = [
-    LLAMA_BIN, "--model", MODEL_PATH,
-    "-c", "768", "-n", "48", "-t", "4", "-b", "128",
-    "-ngl", "0", "--no-warmup", "--interactive-first"
+LLAMA_ARGS = [
+    LLAMA_BIN,
+    "--model", MODEL_PATH,
+    "-c", "768",
+    "-n", "48",
+    "-t", "4",
+    "-b", "128",
+    "-ngl", "0",
+    "--no-warmup"
 ]
+
 MAX_CTX_DOC_CHARS = int(os.getenv("CHAT_CTX_MAX_CHARS", "1600"))
 
 # ---------- Globals ----------
@@ -166,17 +174,14 @@ def _llama_ask(prompt_text: str, max_new_tokens: int = 48) -> str:
         "-ngl", "0", "--no-warmup",
         "-p", prompt_text
     ]
-    proc = subprocess.run(args, capture_output=True, text=True, timeout=180)
+    proc = subprocess.run(args, capture_output=True, text=True, timeout=120)
     if proc.returncode != 0:
-        raise RuntimeError(proc.stderr or "llama-cli failed")
-
+        raise RuntimeError(f"llama-cli failed:\n{proc.stderr}")
     out = proc.stdout.strip()
-
-    # Clean output: remove template tags if present
+    # keep only last non-empty lines (model answer)
     lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
-    if not lines:
-        return out
-    return lines[-1]
+    return lines[-1] if lines else out
+
 
 
 
@@ -293,12 +298,27 @@ async def upload_any(file: UploadFile = File(...), reindex: bool = Query(False),
 async def chat(body: ChatIn):
     if not body.prompt.strip():
         raise HTTPException(400, "Empty prompt")
+
     ctx = _build_rag_context(body.prompt, body.rag_k) if body.use_rag else ""
-    async with _llama_lock:
-        try:
-            _spawn_llama(body.max_new_tokens)
-            prompt = _format_chat(body.system, body.prompt, ctx, body.language)
-            answer = _llama_ask(prompt)
-            return {"answer": answer, "used_rag": body.use_rag, "rag_chars": len(ctx)}
-        except Exception as e:
-            raise HTTPException(500, f"chat failed: {e}")
+
+    # آماده‌سازی prompt
+    prompt = _format_chat(body.system, body.prompt, ctx, body.language)
+
+    try:
+        resp = requests.post(
+            "http://localhost:8080/completion",
+            json={
+                "prompt": prompt,
+                "n_predict": body.max_new_tokens or 48,
+                "temperature": 0.7,
+                "stop": ["<|im_end|>", "</s>"]
+            },
+            timeout=120,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        answer = data.get("content", "").strip()
+        return {"answer": answer, "used_rag": body.use_rag, "rag_chars": len(ctx)}
+    except Exception as e:
+        raise HTTPException(500, f"chat failed: {e}")
+
