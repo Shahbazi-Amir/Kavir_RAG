@@ -8,7 +8,12 @@ from pathlib import Path
 from typing import Iterator, Union, List
 
 from src.loaders import load_any_bytes
-from schema_defs import TextChunk, DocumentManifest, sha1_of_text, validate_chunks
+from src.schema_defs import (
+    TextChunk,
+    DocumentManifest,
+    sha1_of_text,
+    validate_chunks,
+)
 
 
 def stream_bytes(
@@ -29,7 +34,6 @@ def extract_text_stream(
     ext: str,
     ocr: bool = False
 ) -> Iterator[str]:
-    # Stream-safe: accumulate bytes (loader limitation), no RAM spike logic elsewhere
     buffer = bytearray()
     for b in stream_bytes(path):
         buffer.extend(b)
@@ -72,13 +76,11 @@ def ingest_stream(
     stat = path.stat()
     doc_id = str(uuid.uuid4())
 
-    # File checksum
     h = hashlib.sha1()
     for b in stream_bytes(path):
         h.update(b)
     checksum = h.hexdigest()
 
-    # Text stream -> chunks
     text_iter = extract_text_stream(path, ext=ext, ocr=ocr)
     chunks_iter = chunk_text_stream(text_iter, size=size, overlap=overlap)
 
@@ -98,19 +100,22 @@ def ingest_stream(
                 start_char=start_char,
                 end_char=end_char,
                 overlap=overlap,
-                source={"path": str(path), "page_start": None, "page_end": None, "mime": f"file/{ext}"},
+                source={
+                    "path": str(path),
+                    "page_start": None,
+                    "page_end": None,
+                    "mime": f"file/{ext}",
+                },
                 checksum=sha1_of_text(chunk),
             )
         )
 
     validate_chunks(text_chunks)
 
-    # Persist chunks
     with (out_dir / "chunks.jsonl").open("a", encoding="utf-8") as f:
         for ch in text_chunks:
             f.write(json.dumps(ch.__dict__, ensure_ascii=False) + "\n")
 
-    # Persist manifest
     manifest = DocumentManifest(
         doc_id=doc_id,
         path=str(path),
