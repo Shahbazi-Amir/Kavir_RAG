@@ -50,3 +50,7 @@ data/fonts/
 # ignore local models
 data/models/
 *.gguf
+
+
+# Docker image exports
+*.tar
